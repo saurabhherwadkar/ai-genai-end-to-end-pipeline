@@ -11,7 +11,7 @@ A reference architecture that connects 10 independent GenAI components into a un
 | 1 | [ai-genai-llm-guardrails](../ai-genai-llm-guardrails) | Input/output safety — PII detection, prompt injection, toxicity, topic restriction, content filtering |
 | 2 | [ai-genai-llm-router](../ai-genai-llm-router) | Cost optimization — routes queries to Haiku/Sonnet/Opus based on complexity analysis |
 | 3 | [ai-genai-context-manager](../ai-genai-context-manager) | Window management — token counting, trimming (FIFO/sliding/priority), summarization |
-| 4 | [ai-genai-context-memory](../ai-genai-context-memory) | Persistent memory — brain-like memory graph with semantic retrieval and injection |
+| 4 | [ai-genai-context-memory](../ai-genai-context-memory) ([details](components/context-memory.md)) | Persistent memory — brain-like memory graph with semantic retrieval and injection |
 | 5 | [ai-genai-rag](../ai-genai-rag) | Document retrieval — ingestion, embedding, vector search, reranking, response generation |
 | 6 | [ai-genai-graphrag](../ai-genai-graphrag) | Knowledge graph retrieval — entity extraction, graph traversal, community-aware context |
 | 7 | [ai-genai-autocorrection-pipeline](../ai-genai-autocorrection-pipeline) | Quality enforcement — compares responses to ground truth, captures corrections for fine-tuning |
@@ -464,6 +464,27 @@ User Query
 | [ai-genai-llm-observability](../ai-genai-llm-observability) | Performance monitoring | TTFT, latency, cost, OTLP traces, Prometheus metrics |
 | [ai-genai-llm-evaluations](../ai-genai-llm-evaluations) | Response quality scoring | 6 metrics via DeepEval, LLM-as-judge, batch evaluation |
 | [ai-genai-llm-explainability](../ai-genai-llm-explainability) | Model interpretability | Token attribution, SHAP/LIME, CoT analysis, Streamlit dashboard |
+
+---
+
+## Cloud & Platform Implementations
+
+| Platform | Document | Description |
+|----------|----------|-------------|
+| AWS | [end-to-end-pipeline-aws.md](end-to-end-pipeline-aws.md) | Full pipeline mapped to AWS managed services (Bedrock, OpenSearch, Neptune, etc.) |
+| Azure | [end-to-end-pipeline-azure.md](end-to-end-pipeline-azure.md) | Full pipeline mapped to Azure services (OpenAI, AI Search, Cosmos DB, Foundry, etc.) |
+| GCP | [end-to-end-pipeline-gcp.md](end-to-end-pipeline-gcp.md) | Full pipeline mapped to GCP services (Vertex AI, Gemini, Model Armor, Firestore, etc.) |
+| Open-Source | [end-to-end-pipeline-opensource.md](end-to-end-pipeline-opensource.md) | Full pipeline using open-source tools (vLLM, LlamaIndex, Qdrant, Langfuse, etc.) |
+
+---
+
+## Component Documentation
+
+Detailed documentation for individual pipeline components:
+
+| Component | Document |
+|-----------|----------|
+| Context Memory | [components/context-memory.md](components/context-memory.md) |
 
 ---
 
