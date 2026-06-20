@@ -18,8 +18,10 @@ A production-grade implementation of the GenAI LLM application pipeline using Az
 | 8 | Observability | Azure Monitor + Application Insights + Foundry Agent Monitoring |
 | 9 | Evaluations | Microsoft Foundry Evaluations |
 | 10 | Explainability | Azure ML Responsible AI + Foundry Observability Tracing |
-| 11 | Orchestration | Foundry Agent Service + Microsoft Agent Framework |
-| 12 | Infrastructure | API Management + Container Apps + Functions + Event Grid + Service Bus |
+| 11 | LLM Caching | Azure API Management Semantic Cache + Azure Cache for Redis |
+| 12 | LLM Batching | Azure OpenAI Batch API + Azure Durable Functions |
+| 13 | Orchestration | Foundry Agent Service + Microsoft Agent Framework |
+| 14 | Infrastructure | API Management + Container Apps + Functions + Event Grid + Service Bus |
 
 ---
 
@@ -70,6 +72,29 @@ A production-grade implementation of the GenAI LLM application pipeline using Az
 │   └────────────────────────────────────┼──────────────────────────────────────────┘     │
 │                                        │                                                 │
 │                                        ▼                                                 │
+│   ┌───────────────────────────────────────────────────────────────────────────────┐     │
+│   │              LLM CACHE (APIM Semantic Cache + Azure Cache for Redis)           │     │
+│   │                                                                               │     │
+│   │   ┌──────────────────┐       ┌──────────────────────────────────────────┐    │     │
+│   │   │  Incoming Query  │──────▶│           CACHE LOOKUP                   │    │     │
+│   │   └──────────────────┘       │                                          │    │     │
+│   │                              │  Strategy A: Exact Match (Redis hash)     │    │     │
+│   │                              │  Strategy B: APIM Semantic Cache          │    │     │
+│   │                              │    (embedding similarity ≥ 0.95)          │    │     │
+│   │                              └──────────────────┬───────────────────────┘    │     │
+│   │                                                  │                            │     │
+│   │                               ┌─────────────────┴─────────────────┐          │     │
+│   │                               │                                   │          │     │
+│   │                          CACHE HIT                           CACHE MISS      │     │
+│   │                               │                                   │          │     │
+│   │                               ▼                                   ▼          │     │
+│   │                      ┌──────────────────┐              Continue Pipeline     │     │
+│   │                      │  Return Cached   │              (Router → LLM Call)   │     │
+│   │                      │  Response + TTL  │                                    │     │
+│   │                      │  Validation      │                                    │     │
+│   │                      └──────────────────┘                                    │     │
+│   └───────────────────────────────────────────────────────────────────────────────┘     │
+│                                                                                         │
 │   ┌───────────────────────────────────────────────────────────────────────────────┐     │
 │   │              MICROSOFT FOUNDRY MODEL ROUTER                                    │     │
 │   │              [Automatic model selection via Responses API]                     │     │
@@ -272,7 +297,32 @@ A production-grade implementation of the GenAI LLM application pipeline using Az
 │   │  • Per-deployment      │ │                        │ │                            │  │
 │   │    token tracking      │ │                        │ │                            │  │
 │   │  • Budget alerts       │ │                        │ │                            │  │
-│   └────────────────────────┘ └────────────────────────┘ └────────────────────────────┘  │
+│   └────────────────────────┘ └────────────┬───────────┘ └────────────────────────────┘  │
+│                                           │                                              │
+│                                           ▼                                              │
+│   ┌─────────────────────────────────────────────────────────────────────────────────┐   │
+│   │                  LLM BATCHING (Azure OpenAI Batch API)                            │   │
+│   │                                                                                  │   │
+│   │   ┌────────────────────────────────────────────────────────────────────────┐    │   │
+│   │   │                      BATCH JOB MANAGER                                 │    │   │
+│   │   │                                                                        │    │   │
+│   │   │  ┌──────────────────┐  ┌──────────────────┐  ┌─────────────────────┐  │    │   │
+│   │   │  │  Upload JSONL    │  │  Batch Job       │  │  Download Results   │  │    │   │
+│   │   │  │  (collect eval   │  │  (/batches API   │  │  (map responses     │  │    │   │
+│   │   │  │   queries)       │  │   with 24h       │  │   back to queries)  │  │    │   │
+│   │   │  │                  │  │   completion)    │  │                     │  │    │   │
+│   │   │  └────────┬─────────┘  └────────┬─────────┘  └──────────┬──────────┘  │    │   │
+│   │   │           └─────────────────────┼────────────────────────┘             │    │   │
+│   │   │                                 │                                      │    │   │
+│   │   │              Up to 50% cost savings vs real-time inference             │    │   │
+│   │   └────────────────────────────────────────────────────────────────────────┘    │   │
+│   │                                                                                  │   │
+│   │   Use Cases:                                                                     │   │
+│   │   • Batch evaluation scoring (submit 100s of eval queries at once)              │   │
+│   │   • Offline quality assessments (nightly eval runs via Durable Functions)        │   │
+│   │   • Fine-tuning data validation (bulk comparison against ground truth)          │   │
+│   │   • A/B test evaluation (compare model versions across test suites)             │   │
+│   └─────────────────────────────────────────────────────────────────────────────────┘   │
 │                                                                                         │
 └─────────────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -346,6 +396,48 @@ response = client.responses.create(
     model="model-router",
     input="What is the capital of France?"
 )
+```
+
+#### LLM Cache (APIM Semantic Cache + Azure Cache for Redis)
+
+Two caching layers reduce cost and latency:
+
+**Layer 1: API Management Semantic Cache (built-in)**
+- Semantic similarity matching on incoming requests (embedding-based)
+- Configurable similarity threshold (recommended ≥ 0.95)
+- TTL-based expiry per cache entry
+- No custom infrastructure — configured as an APIM policy
+- On **CACHE HIT**: returns cached response at the gateway level (no backend call)
+
+**Layer 2: Application-Level Cache (Azure Cache for Redis)**
+- Exact match: Hash-based key lookup for identical queries (sub-millisecond)
+- Semantic match: Embedding similarity via Azure OpenAI text-embedding-3
+- TTL management per query type
+- On **CACHE MISS**: continues to Router; after LLM response, writes to cache
+
+```python
+from azure.identity import DefaultAzureCredential
+import redis
+import hashlib
+import json
+
+cache = redis.Redis(
+    host="your-cache.redis.cache.windows.net",
+    port=6380,
+    ssl=True,
+    password=get_redis_key()
+)
+
+def check_cache(query: str) -> dict | None:
+    cache_key = hashlib.sha256(query.encode()).hexdigest()
+    cached = cache.get(f"llm:exact:{cache_key}")
+    if cached:
+        return json.loads(cached)
+    return None
+
+def write_cache(query: str, response: dict, ttl: int = 3600):
+    cache_key = hashlib.sha256(query.encode()).hexdigest()
+    cache.setex(f"llm:exact:{cache_key}", ttl, json.dumps(response))
 ```
 
 ---
@@ -646,6 +738,45 @@ eval_run = client.evals.runs.create(
 
 **Continuous evaluation:** Foundry supports scheduled evaluations + continuous evaluation rules on sampled production responses + alert configuration for quality degradation.
 
+#### LLM Batching (Azure OpenAI Batch API)
+
+The [Azure OpenAI Batch API](https://learn.microsoft.com/en-us/azure/ai-services/openai/how-to/batch) enables submitting large volumes of evaluation queries at reduced cost:
+
+- Upload JSONL files containing hundreds/thousands of requests
+- Batch jobs complete within 24 hours at up to 50% cost savings
+- Results downloadable as JSONL, mapped back to original custom_ids
+- Supports all Azure OpenAI models (GPT-4.1, GPT-5.4, etc.)
+
+```python
+from openai import AzureOpenAI
+
+client = AzureOpenAI(
+    azure_endpoint="https://YOUR-RESOURCE.openai.azure.com",
+    azure_ad_token_provider=token_provider,
+    api_version="2025-12-01-preview"
+)
+
+# Upload batch input file
+batch_file = client.files.create(
+    file=open("eval-queries.jsonl", "rb"),
+    purpose="batch"
+)
+
+# Create batch job
+batch_job = client.batches.create(
+    input_file_id=batch_file.id,
+    endpoint="/chat/completions",
+    completion_window="24h"
+)
+
+# Poll for completion
+status = client.batches.retrieve(batch_job.id)
+if status.status == "completed":
+    results = client.files.content(status.output_file_id)
+```
+
+**Scheduling:** Use Azure Durable Functions with timer triggers for nightly/weekly batch evaluation runs.
+
 #### Explainability
 
 | Approach | Azure Service | Capability |
@@ -804,6 +935,10 @@ User Query
     │         │
     │         PASS
     │         │
+    ├──► [APIM Semantic Cache + Redis: Lookup]  ──── HIT ──► Return Cached Response ──► User
+    │         │
+    │         MISS
+    │         │
     ├──► [Foundry Model Router: model="model-router"] ──► Model Tier Decision
     │         │
     │    ┌────┴────────────────────────────────────┐
@@ -821,6 +956,8 @@ User Query
     │         ▼
     │    [Azure OpenAI Responses API: Routed Model + Context + Inline Filters]
     │         │
+    │         ├──► [Redis Cache: Write response + metadata + TTL]
+    │         │
     │         ▼
     │    [Content Safety: Output Filters]  ──── BLOCK ──► Regenerate / Error
     │         │
@@ -835,6 +972,7 @@ User Query
     │
     └──► [Application Insights + Monitor: Metrics + Traces across all steps]
     └──► [Foundry Evaluations: Quality scoring (scheduled + continuous)]
+    │         └──► [Azure OpenAI Batch API: Submit bulk eval queries at 50% cost]
     └──► [Foundry Agent Monitoring: Per-agent observability]
 ```
 
@@ -865,6 +1003,8 @@ User Query
 | RAG | Azure AI Search (hybrid + semantic ranking) |
 | Vector Store | Azure Cosmos DB (DiskANN) + Azure AI Search |
 | Graph Store | Azure Cosmos DB Gremlin API |
+| Caching | Azure API Management Semantic Cache + Azure Cache for Redis |
+| Batch Processing | Azure OpenAI Batch API + Durable Functions |
 | Document Store | Azure Cosmos DB (NoSQL API) |
 | Object Storage | Azure Blob Storage |
 | Orchestration | Foundry Agent Service + Durable Functions |

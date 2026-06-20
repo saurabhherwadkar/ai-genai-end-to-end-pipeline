@@ -18,8 +18,10 @@ A production-grade implementation of the GenAI LLM application pipeline using Go
 | 8 | Observability | Cloud Monitoring + Cloud Trace + Cloud Logging |
 | 9 | Evaluations | Vertex AI Gen AI Evaluation Service |
 | 10 | Explainability | Grounding with Citations + Gen AI Evaluation (custom metrics) |
-| 11 | Orchestration | Gemini Enterprise Agent Platform + Agent Development Kit (ADK) |
-| 12 | Infrastructure | Cloud Run + Cloud Functions + Pub/Sub + Eventarc + API Gateway |
+| 11 | LLM Caching | Memorystore for Redis + Vertex AI Context Caching |
+| 12 | LLM Batching | Vertex AI Batch Prediction + Cloud Workflows |
+| 13 | Orchestration | Gemini Enterprise Agent Platform + Agent Development Kit (ADK) |
+| 14 | Infrastructure | Cloud Run + Cloud Functions + Pub/Sub + Eventarc + API Gateway |
 
 ---
 
@@ -68,6 +70,31 @@ A production-grade implementation of the GenAI LLM application pipeline using Go
 │   └────────────────────────────────────┼──────────────────────────────────────────┘     │
 │                                        │                                                 │
 │                                        ▼                                                 │
+│   ┌───────────────────────────────────────────────────────────────────────────────┐     │
+│   │              LLM CACHE (Memorystore Redis + Vertex AI Context Caching)         │     │
+│   │                                                                               │     │
+│   │   ┌──────────────────┐       ┌──────────────────────────────────────────┐    │     │
+│   │   │  Incoming Query  │──────▶│           CACHE LOOKUP                   │    │     │
+│   │   └──────────────────┘       │                                          │    │     │
+│   │                              │  Strategy A: Exact Match (Redis hash)     │    │     │
+│   │                              │  Strategy B: Semantic Similarity          │    │     │
+│   │                              │    (Gemini Embedding cosine ≥ 0.95)       │    │     │
+│   │                              │  Strategy C: Context Caching             │    │     │
+│   │                              │    (GenAiCacheService for prefixes)       │    │     │
+│   │                              └──────────────────┬───────────────────────┘    │     │
+│   │                                                  │                            │     │
+│   │                               ┌─────────────────┴─────────────────┐          │     │
+│   │                               │                                   │          │     │
+│   │                          CACHE HIT                           CACHE MISS      │     │
+│   │                               │                                   │          │     │
+│   │                               ▼                                   ▼          │     │
+│   │                      ┌──────────────────┐              Continue Pipeline     │     │
+│   │                      │  Return Cached   │              (Router → LLM Call)   │     │
+│   │                      │  Response + TTL  │                                    │     │
+│   │                      │  Validation      │                                    │     │
+│   │                      └──────────────────┘                                    │     │
+│   └───────────────────────────────────────────────────────────────────────────────┘     │
+│                                                                                         │
 │   ┌───────────────────────────────────────────────────────────────────────────────┐     │
 │   │              CUSTOM LLM ROUTER (Cloud Run Service)                             │     │
 │   │              [Complexity-based routing — custom implementation]                │     │
@@ -274,7 +301,32 @@ A production-grade implementation of the GenAI LLM application pipeline using Go
 │   │  • Tool invocations    │ │                        │ │                            │  │
 │   │  • Agent-to-agent      │ │                        │ │                            │  │
 │   │    communication logs  │ │                        │ │                            │  │
-│   └────────────────────────┘ └────────────────────────┘ └────────────────────────────┘  │
+│   └────────────────────────┘ └────────────┬───────────┘ └────────────────────────────┘  │
+│                                           │                                              │
+│                                           ▼                                              │
+│   ┌─────────────────────────────────────────────────────────────────────────────────┐   │
+│   │                  LLM BATCHING (Vertex AI Batch Prediction)                        │   │
+│   │                                                                                  │   │
+│   │   ┌────────────────────────────────────────────────────────────────────────┐    │   │
+│   │   │                      BATCH JOB MANAGER                                 │    │   │
+│   │   │                                                                        │    │   │
+│   │   │  ┌──────────────────┐  ┌──────────────────┐  ┌─────────────────────┐  │    │   │
+│   │   │  │  GCS Input JSONL │  │  Batch Prediction│  │  GCS Output JSONL   │  │    │   │
+│   │   │  │  (collect eval   │  │  Job (Vertex AI  │  │  (results mapped    │  │    │   │
+│   │   │  │   queries)       │  │   BatchPredict-  │  │   back to queries)  │  │    │   │
+│   │   │  │                  │  │   ionJob)        │  │                     │  │    │   │
+│   │   │  └────────┬─────────┘  └────────┬─────────┘  └──────────┬──────────┘  │    │   │
+│   │   │           └─────────────────────┼────────────────────────┘             │    │   │
+│   │   │                                 │                                      │    │   │
+│   │   │              Up to 50% cost savings vs real-time inference             │    │   │
+│   │   └────────────────────────────────────────────────────────────────────────┘    │   │
+│   │                                                                                  │   │
+│   │   Use Cases:                                                                     │   │
+│   │   • Batch evaluation scoring (submit 100s of eval queries at once)              │   │
+│   │   • Offline quality assessments (nightly eval runs via Cloud Scheduler)          │   │
+│   │   • Fine-tuning data validation (bulk comparison against ground truth)          │   │
+│   │   • A/B test evaluation (AutoSxS pairwise comparison at scale)                  │   │
+│   └─────────────────────────────────────────────────────────────────────────────────┘   │
 │                                                                                         │
 └─────────────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -350,6 +402,42 @@ response = dlp_client.inspect_content(
 
 if response.result.findings:
     return {"blocked": True, "pii_detected": [f.info_type.name for f in response.result.findings]}
+```
+
+#### LLM Cache (Memorystore Redis + Context Caching)
+
+Two caching layers reduce cost and latency:
+
+**Layer 1: Response Cache (Memorystore for Redis)**
+- Exact match: Hash-based key lookup for identical queries (sub-millisecond)
+- Semantic match: Embedding similarity via Gemini Embedding 2 (cosine threshold ≥ 0.95)
+- TTL management: Configurable expiry per query type
+- On **CACHE HIT**: returns cached response immediately, bypassing the full pipeline
+- On **CACHE MISS**: continues to Router; after LLM response, writes to cache
+
+**Layer 2: Context Prefix Cache (Vertex AI Context Caching / GenAiCacheService)**
+- Caches repeated system prompts and context prefixes across requests
+- Up to 75% cost reduction on cached tokens
+- Supports time-based and usage-based TTL
+- Works with Gemini models natively
+
+```python
+import redis
+import hashlib
+import json
+
+cache = redis.Redis(host="memorystore-ip", port=6379)
+
+def check_cache(query: str) -> dict | None:
+    cache_key = hashlib.sha256(query.encode()).hexdigest()
+    cached = cache.get(f"llm:exact:{cache_key}")
+    if cached:
+        return json.loads(cached)
+    return None
+
+def write_cache(query: str, response: dict, ttl: int = 3600):
+    cache_key = hashlib.sha256(query.encode()).hexdigest()
+    cache.setex(f"llm:exact:{cache_key}", ttl, json.dumps(response))
 ```
 
 #### Custom LLM Router (Cloud Run)
@@ -716,6 +804,35 @@ print(f"Coherence: {results.summary_metrics['coherence/mean']}")
 
 **AutoSxS Pipeline:** Automatic pairwise side-by-side evaluation for comparing model outputs systematically (e.g., comparing Gemini Flash vs Pro on your specific use case).
 
+#### LLM Batching (Vertex AI Batch Prediction)
+
+[Vertex AI Batch Prediction](https://cloud.google.com/vertex-ai/generative-ai/docs/multimodal/batch-prediction-gemini) enables submitting large volumes of evaluation queries at reduced cost:
+
+- Submit JSONL files to Cloud Storage with hundreds/thousands of inference requests
+- Vertex AI processes asynchronously with up to 50% cost savings vs real-time
+- Results written to GCS output bucket, mapped back to original requests
+- Supports all Gemini models and partner models in Model Garden
+
+```python
+from google.cloud import aiplatform
+
+aiplatform.init(project=PROJECT, location=LOCATION)
+
+batch_job = aiplatform.BatchPredictionJob.create(
+    job_display_name="nightly-eval-run",
+    model_name="publishers/google/models/gemini-2.5-flash",
+    gcs_source="gs://eval-bucket/input/eval-queries.jsonl",
+    gcs_destination_prefix="gs://eval-bucket/output/",
+    instances_format="jsonl",
+    predictions_format="jsonl"
+)
+
+batch_job.wait()
+print(f"Output: {batch_job.output_info.gcs_output_directory}")
+```
+
+**Scheduling:** Use Cloud Scheduler + Cloud Workflows to trigger nightly/weekly batch evaluation runs.
+
 #### Explainability
 
 | Approach | GCP Service | Capability |
@@ -872,6 +989,10 @@ User Query
     │         │
     │         PASS
     │         │
+    ├──► [Memorystore Redis: Cache Lookup]  ──── HIT ──► Return Cached Response ──► User
+    │         │
+    │         MISS
+    │         │
     ├──► [Cloud Run: Custom Router + countTokens] ──► Model Tier Decision
     │         │
     │    ┌────┴────────────────────────────────────┐
@@ -889,6 +1010,8 @@ User Query
     │         ▼
     │    [Vertex AI Gemini API: Routed Model + Context + Safety Settings]
     │         │
+    │         ├──► [Memorystore Redis: Write response + metadata + TTL]
+    │         │
     │         ▼
     │    [Model Armor: Sanitize Model Response]  ──── BLOCK ──► Regenerate / Error
     │         │
@@ -903,6 +1026,7 @@ User Query
     │
     └──► [Cloud Trace + Monitoring: Metrics + Traces across all steps]
     └──► [Gen AI Evaluation: Quality scoring (batch + scheduled)]
+    │         └──► [Vertex AI Batch Prediction: Submit bulk eval queries at 50% cost]
     └──► [Cloud Logging: Full I/O to BigQuery for analysis]
 ```
 
@@ -933,6 +1057,8 @@ User Query
 | RAG | Vertex AI RAG Engine + Vertex AI Search |
 | Vector Store | Firestore (vector) / AlloyDB AI / Vertex AI Vector Search |
 | Graph Store | Neo4j Aura (GCP Marketplace) |
+| Caching | Memorystore for Redis + Vertex AI Context Caching |
+| Batch Processing | Vertex AI Batch Prediction + Cloud Workflows |
 | Document Store | Firestore |
 | Object Storage | Cloud Storage |
 | Orchestration | Agent Platform + Cloud Workflows |

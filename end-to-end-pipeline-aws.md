@@ -18,8 +18,10 @@ A production-grade implementation of the GenAI LLM application pipeline using AW
 | 8 | Observability | Amazon CloudWatch + AWS X-Ray + Bedrock Model Invocation Logging |
 | 9 | Evaluations | Amazon Bedrock Evaluations + FMEval |
 | 10 | Explainability | Amazon SageMaker Clarify + Custom Lambda |
-| 11 | Orchestration | Amazon Bedrock Flows + Amazon Bedrock Agents |
-| 12 | Infrastructure | API Gateway + Lambda/ECS Fargate + Step Functions + EventBridge + SQS |
+| 11 | LLM Caching | Amazon ElastiCache (Redis OSS) + Amazon Bedrock Prompt Caching |
+| 12 | LLM Batching | Amazon Bedrock Batch Inference + AWS Step Functions |
+| 13 | Orchestration | Amazon Bedrock Flows + Amazon Bedrock Agents |
+| 14 | Infrastructure | API Gateway + Lambda/ECS Fargate + Step Functions + EventBridge + SQS |
 
 ---
 
@@ -67,6 +69,31 @@ A production-grade implementation of the GenAI LLM application pipeline using AW
 │   └────────────────────────────────────┼──────────────────────────────────────────┘     │
 │                                        │                                                 │
 │                                        ▼                                                 │
+│   ┌───────────────────────────────────────────────────────────────────────────────┐     │
+│   │                    LLM CACHE (ElastiCache Redis + Bedrock Prompt Caching)      │     │
+│   │                                                                               │     │
+│   │   ┌──────────────────┐       ┌──────────────────────────────────────────┐    │     │
+│   │   │  Incoming Query  │──────▶│           CACHE LOOKUP                   │    │     │
+│   │   └──────────────────┘       │                                          │    │     │
+│   │                              │  Strategy A: Exact Match (Redis hash)     │    │     │
+│   │                              │  Strategy B: Semantic Similarity          │    │     │
+│   │                              │    (Titan Embeddings cosine ≥ 0.95)       │    │     │
+│   │                              │  Strategy C: Bedrock Prompt Caching       │    │     │
+│   │                              │    (reuse common context prefixes)        │    │     │
+│   │                              └──────────────────┬───────────────────────┘    │     │
+│   │                                                  │                            │     │
+│   │                               ┌─────────────────┴─────────────────┐          │     │
+│   │                               │                                   │          │     │
+│   │                          CACHE HIT                           CACHE MISS      │     │
+│   │                               │                                   │          │     │
+│   │                               ▼                                   ▼          │     │
+│   │                      ┌──────────────────┐              Continue Pipeline     │     │
+│   │                      │  Return Cached   │              (Router → LLM Call)   │     │
+│   │                      │  Response + TTL  │                                    │     │
+│   │                      │  Validation      │                                    │     │
+│   │                      └──────────────────┘                                    │     │
+│   └───────────────────────────────────────────────────────────────────────────────┘     │
+│                                                                                         │
 │   ┌───────────────────────────────────────────────────────────────────────────────┐     │
 │   │              AMAZON BEDROCK INTELLIGENT PROMPT ROUTING                         │     │
 │   │              [Up to 30% cost reduction while maintaining quality]              │     │
@@ -281,7 +308,32 @@ A production-grade implementation of the GenAI LLM application pipeline using AW
 │   │    team, project)      │ │                        │ │                            │  │
 │   │  • AWS Cost Explorer   │ │                        │ │                            │  │
 │   │  • Budget Alerts       │ │                        │ │                            │  │
-│   └────────────────────────┘ └────────────────────────┘ └────────────────────────────┘  │
+│   └────────────────────────┘ └────────────┬───────────┘ └────────────────────────────┘  │
+│                                           │                                              │
+│                                           ▼                                              │
+│   ┌─────────────────────────────────────────────────────────────────────────────────┐   │
+│   │                  LLM BATCHING (Bedrock Batch Inference)                           │   │
+│   │                                                                                  │   │
+│   │   ┌────────────────────────────────────────────────────────────────────────┐    │   │
+│   │   │                      BATCH JOB MANAGER                                 │    │   │
+│   │   │                                                                        │    │   │
+│   │   │  ┌──────────────────┐  ┌──────────────────┐  ┌─────────────────────┐  │    │   │
+│   │   │  │  S3 Input JSONL  │  │  Batch Inference │  │  S3 Output JSONL    │  │    │   │
+│   │   │  │  (collect eval   │  │  Job (Bedrock    │  │  (results mapped    │  │    │   │
+│   │   │  │   queries)       │  │   CreateModel-   │  │   back to queries)  │  │    │   │
+│   │   │  │                  │  │   InvocationJob) │  │                     │  │    │   │
+│   │   │  └────────┬─────────┘  └────────┬─────────┘  └──────────┬──────────┘  │    │   │
+│   │   │           └─────────────────────┼────────────────────────┘             │    │   │
+│   │   │                                 │                                      │    │   │
+│   │   │              Up to 50% cost savings vs real-time inference             │    │   │
+│   │   └────────────────────────────────────────────────────────────────────────┘    │   │
+│   │                                                                                  │   │
+│   │   Use Cases:                                                                     │   │
+│   │   • Batch evaluation scoring (submit 100s of eval queries at once)              │   │
+│   │   • Offline quality assessments (nightly eval runs via EventBridge)              │   │
+│   │   • Fine-tuning data validation (bulk comparison against ground truth)          │   │
+│   │   • A/B test evaluation (compare model versions across test suites)             │   │
+│   └─────────────────────────────────────────────────────────────────────────────────┘   │
 │                                                                                         │
 └─────────────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -351,6 +403,41 @@ response = bedrock_runtime.converse(
 - Handles unplanned traffic bursts by automatically routing to Regions with available capacity
 - No additional routing cost — pricing is based on source Region
 - Limitation: does not support Provisioned Throughput
+
+#### LLM Cache (ElastiCache + Bedrock Prompt Caching)
+
+Two caching layers reduce cost and latency:
+
+**Layer 1: Response Cache (Amazon ElastiCache for Redis OSS)**
+- Exact match: Hash-based key lookup for identical queries (sub-millisecond)
+- Semantic match: Embedding similarity via Titan Embeddings (cosine threshold ≥ 0.95)
+- TTL management: Configurable expiry per query type
+- On **CACHE HIT**: returns cached response immediately, bypassing the full pipeline
+- On **CACHE MISS**: continues to Router; after LLM response, writes to cache
+
+**Layer 2: Context Prefix Cache (Amazon Bedrock Prompt Caching)**
+- Caches common system prompts and context prefixes across requests
+- Reduces input token costs for repeated context patterns
+- Managed by Bedrock — no infrastructure to configure
+
+```python
+import redis
+import hashlib
+import json
+
+cache = redis.Redis(host="elasticache-endpoint", port=6379, ssl=True)
+
+def check_cache(query: str) -> dict | None:
+    cache_key = hashlib.sha256(query.encode()).hexdigest()
+    cached = cache.get(f"llm:exact:{cache_key}")
+    if cached:
+        return json.loads(cached)
+    return None
+
+def write_cache(query: str, response: dict, ttl: int = 3600):
+    cache_key = hashlib.sha256(query.encode()).hexdigest()
+    cache.setex(f"llm:exact:{cache_key}", ttl, json.dumps(response))
+```
 
 ---
 
@@ -644,6 +731,38 @@ eval_algo = QAAccuracy()
 results = eval_algo.evaluate(model=model_runner, dataset=eval_dataset)
 ```
 
+#### LLM Batching (Bedrock Batch Inference)
+
+[Amazon Bedrock Batch Inference](https://docs.aws.amazon.com/bedrock/latest/userguide/batch-inference.html) enables submitting large volumes of evaluation queries at reduced cost:
+
+- Submit JSONL files to S3 with hundreds/thousands of inference requests
+- Bedrock processes asynchronously with up to 50% cost savings vs real-time
+- Results written to S3 output bucket, mapped back to original queries
+- Supports all Bedrock models (Claude, Nova, Llama, Mistral)
+
+```python
+bedrock = boto3.client("bedrock")
+
+response = bedrock.create_model_invocation_job(
+    jobName="nightly-eval-run",
+    modelId="anthropic.claude-sonnet-4-20250514-v1:0",
+    roleArn="arn:aws:iam::ACCOUNT:role/BedrockBatchRole",
+    inputDataConfig={
+        "s3InputDataConfig": {
+            "s3Uri": "s3://eval-bucket/input/eval-queries.jsonl",
+            "s3InputFormat": "JSONL"
+        }
+    },
+    outputDataConfig={
+        "s3OutputDataConfig": {
+            "s3Uri": "s3://eval-bucket/output/"
+        }
+    }
+)
+```
+
+**Scheduling:** Use Amazon EventBridge to trigger nightly/weekly batch evaluation runs via Step Functions orchestration.
+
 #### Explainability
 
 | Approach | AWS Service | Capability |
@@ -807,6 +926,10 @@ User Query
     │         │
     │         PASS
     │         │
+    ├──► [ElastiCache: Cache Lookup]  ──── HIT ──► Return Cached Response ──► User
+    │         │
+    │         MISS
+    │         │
     ├──► [Bedrock Intelligent Prompt Routing] ──► Model Tier Decision
     │         │
     │    ┌────┴────────────────────────────────────┐
@@ -824,6 +947,8 @@ User Query
     │         ▼
     │    [Bedrock Converse API: Selected Model + Context + Inline Guardrails]
     │         │
+    │         ├──► [ElastiCache: Write response + metadata + TTL]
+    │         │
     │         ▼
     │    [Bedrock Guardrails: Output]  ──── INTERVENE ──► Regenerate / Error
     │         │
@@ -838,6 +963,7 @@ User Query
     │
     └──► [CloudWatch + X-Ray: Metrics + Traces across all steps]
     └──► [Bedrock Evaluations: Quality scoring (batch)]
+    │         └──► [Bedrock Batch Inference: Submit bulk eval queries at 50% cost]
     └──► [Bedrock Invocation Logging: Full I/O to S3]
 ```
 
@@ -868,6 +994,8 @@ User Query
 | RAG | Amazon Bedrock Knowledge Bases |
 | Vector Store | Amazon OpenSearch Serverless (vector engine) |
 | Graph Store | Amazon Neptune / Neptune Analytics |
+| Caching | Amazon ElastiCache (Redis OSS) + Bedrock Prompt Caching |
+| Batch Processing | Amazon Bedrock Batch Inference + Step Functions |
 | Key-Value Store | Amazon DynamoDB |
 | Object Storage | Amazon S3 |
 | Orchestration | Amazon Bedrock Flows + AWS Step Functions |

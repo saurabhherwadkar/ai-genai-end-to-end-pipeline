@@ -1,6 +1,6 @@
 # AI GenAI End-to-End Pipeline
 
-A reference architecture that connects 10 independent GenAI components into a unified, production-grade LLM application pipeline. This document describes how evaluations, explainability, GraphRAG, LLM routing, observability, context memory, RAG, context management, auto-correction, and guardrails work together to deliver safe, cost-optimized, context-rich, and continuously-improving LLM responses.
+A reference architecture that connects 12 independent GenAI components into a unified, production-grade LLM application pipeline. This document describes how evaluations, explainability, GraphRAG, LLM routing, observability, context memory, RAG, context management, auto-correction, guardrails, caching, and LLM batching work together to deliver safe, cost-optimized, context-rich, and continuously-improving LLM responses.
 
 ---
 
@@ -18,6 +18,8 @@ A reference architecture that connects 10 independent GenAI components into a un
 | 8 | [ai-genai-llm-observability](../ai-genai-llm-observability) | Monitoring — TTFT, latency, token usage, cost tracking, distributed tracing |
 | 9 | [ai-genai-llm-evaluations](../ai-genai-llm-evaluations) | Quality measurement — relevancy, faithfulness, hallucination, toxicity, bias scoring |
 | 10 | [ai-genai-llm-explainability](../ai-genai-llm-explainability) | Reasoning analysis — token attribution, SHAP/LIME, chain-of-thought quality |
+| 11 | [ai-genai-llm-caching](../ai-genai-llm-caching) | Response caching — semantic cache lookup, exact match, TTL management, cost savings |
+| 12 | [ai-genai-llm-batching](../ai-genai-llm-batching) | Batch processing — submit multiple evaluation queries concurrently, async job management |
 
 ---
 
@@ -51,6 +53,29 @@ A reference architecture that connects 10 independent GenAI components into a un
 │                                        │                                                 │
 │                                        ▼                                                 │
 │   ┌───────────────────────────────────────────────────────────────────────────────┐     │
+│   │                            LLM CACHE                                          │     │
+│   │                                                                               │     │
+│   │   ┌──────────────────┐       ┌──────────────────────────────────────────┐    │     │
+│   │   │  Incoming Query  │──────▶│           CACHE LOOKUP                   │    │     │
+│   │   └──────────────────┘       │                                          │    │     │
+│   │                              │  Strategy A: Exact Match (hash-based)     │    │     │
+│   │                              │  Strategy B: Semantic Similarity          │    │     │
+│   │                              │              (embedding cosine ≥ 0.95)    │    │     │
+│   │                              └──────────────────┬───────────────────────┘    │     │
+│   │                                                  │                            │     │
+│   │                               ┌─────────────────┴─────────────────┐          │     │
+│   │                               │                                   │          │     │
+│   │                          CACHE HIT                           CACHE MISS      │     │
+│   │                               │                                   │          │     │
+│   │                               ▼                                   ▼          │     │
+│   │                      ┌──────────────────┐              Continue Pipeline     │     │
+│   │                      │  Return Cached   │              (Router → LLM Call)   │     │
+│   │                      │  Response + TTL  │                                    │     │
+│   │                      │  Validation      │                                    │     │
+│   │                      └──────────────────┘                                    │     │
+│   └───────────────────────────────────────────────────────────────────────────────┘     │
+│                                                                                         │
+│   ┌───────────────────────────────────────────────────────────────────────────────┐     │
 │   │                          LLM ROUTER                                           │     │
 │   │                                                                               │     │
 │   │   ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────┐ ┌──────┐    │     │
@@ -68,6 +93,10 @@ A reference architecture that connects 10 independent GenAI components into a un
 │   │      │  (≤ 0.3)    │      │  (≤ 0.7)    │      │  (> 0.7)    │             │     │
 │   │      │  Fast/Cheap │      │  Balanced   │      │  Capable    │             │     │
 │   │      └─────────────┘      └─────────────┘      └─────────────┘             │     │
+│   │                                                                               │     │
+│   │   ┌───────────────────────────────────────────────────────────────────────┐   │     │
+│   │   │  On LLM Response: Write to Cache (query → response + metadata + TTL) │   │     │
+│   │   └───────────────────────────────────────────────────────────────────────┘   │     │
 │   └───────────────────────────────────────────────────────────────────────────────┘     │
 │                                                                                         │
 └───────────────────────────────────────────┬─────────────────────────────────────────────┘
@@ -220,7 +249,34 @@ A reference architecture that connects 10 independent GenAI components into a un
 │   │  • OTLP (traces)      │ │  with LLM-as-judge    │ │  • Streamlit Dashboard     │  │
 │   │  • Prometheus          │ │  evaluation           │ │  • Heatmaps & Plots        │  │
 │   │                        │ │                        │ │                            │  │
-│   └────────────────────────┘ └────────────────────────┘ └────────────────────────────┘  │
+│   └────────────────────────┘ └────────────┬───────────┘ └────────────────────────────┘  │
+│                                           │                                              │
+│                                           ▼                                              │
+│   ┌─────────────────────────────────────────────────────────────────────────────────┐   │
+│   │                           LLM BATCHING                                           │   │
+│   │                                                                                  │   │
+│   │   ┌────────────────────────────────────────────────────────────────────────┐    │   │
+│   │   │                      BATCH JOB MANAGER                                 │    │   │
+│   │   │                                                                        │    │   │
+│   │   │  ┌──────────────────┐  ┌──────────────────┐  ┌─────────────────────┐  │    │   │
+│   │   │  │  Query Collector │  │  Batch Scheduler │  │  Result Aggregator  │  │    │   │
+│   │   │  │  (accumulate     │  │  (group by model │  │  (collect async     │  │    │   │
+│   │   │  │   eval queries)  │  │   tier, submit   │  │   responses, map    │  │    │   │
+│   │   │  │                  │  │   as batch)      │  │   back to queries)  │  │    │   │
+│   │   │  └────────┬─────────┘  └────────┬─────────┘  └──────────┬──────────┘  │    │   │
+│   │   │           └─────────────────────┼────────────────────────┘             │    │   │
+│   │   │                                 │                                      │    │   │
+│   │   │                    Async Batch API Calls                               │    │   │
+│   │   │              (reduces cost via batch pricing)                          │    │   │
+│   │   └────────────────────────────────────────────────────────────────────────┘    │   │
+│   │                                                                                  │   │
+│   │   Use Cases:                                                                     │   │
+│   │   • Batch evaluation scoring (submit 100s of eval queries at once)              │   │
+│   │   • Offline quality assessments (nightly eval runs)                              │   │
+│   │   • Fine-tuning data validation (bulk comparison against ground truth)          │   │
+│   │   • A/B test evaluation (compare model versions across test suites)             │   │
+│   │                                                                                  │   │
+│   └─────────────────────────────────────────────────────────────────────────────────┘   │
 │                                                                                         │
 │         ▲                            ▲                            ▲                      │
 │         │                            │                            │                      │
@@ -238,7 +294,7 @@ A reference architecture that connects 10 independent GenAI components into a un
 
 ### Phase 1: Input Processing
 
-The entry point for every user query. Two components act as gatekeepers before any LLM call is made.
+The entry point for every user query. Three components act as gatekeepers before any LLM call is made.
 
 **Guardrails (Input)** validates the raw user input:
 - Detects and blocks PII (emails, phone numbers, SSNs)
@@ -246,6 +302,14 @@ The entry point for every user query. Two components act as gatekeepers before a
 - Filters toxic or harmful content
 - Enforces topic restrictions (e.g., no medical/legal advice)
 - Decision: **BLOCK** (reject with explanation) or **PASS** (continue pipeline)
+
+**LLM Cache** checks whether a sufficiently similar query has been answered before:
+- Exact match lookup via hash-based key (fastest path)
+- Semantic similarity lookup via embedding cosine similarity (threshold ≥ 0.95)
+- Validates TTL (time-to-live) to ensure cached responses haven't expired
+- On **CACHE HIT**: returns the cached response immediately, bypassing the rest of the pipeline (saves cost and latency)
+- On **CACHE MISS**: continues to the Router and downstream components
+- After a successful LLM response, writes the query→response pair to the cache with metadata and TTL
 
 **LLM Router** analyzes query complexity across six signals (length, vocabulary richness, domain keywords, question type, code/math presence, multi-step reasoning) to produce a weighted score (0.0–1.0). This score determines which model tier handles the request:
 - Score ≤ 0.3 → Claude Haiku (fast, low cost)
@@ -342,6 +406,14 @@ Three systems operate as cross-cutting concerns, instrumenting every phase of th
 - Contextual Relevancy — was the retrieved context actually useful?
 - Uses DeepEval framework with LLM-as-judge methodology
 
+**LLM Batching** enables efficient bulk evaluation by submitting multiple queries as a single batch job:
+- Collects evaluation queries (e.g., hundreds of test cases) into a batch request
+- Groups queries by model tier for optimal routing and pricing
+- Submits via provider batch APIs (Anthropic Message Batches, OpenAI Batch API) at reduced cost (typically 50% discount)
+- Manages async job lifecycle: submission → polling → result collection
+- Aggregates results back to individual queries for scoring and analysis
+- Use cases: nightly eval runs, fine-tuning data validation, A/B model comparison, bulk quality assessments
+
 **Explainability** provides interpretability into model behavior:
 - Token Attribution — which input tokens most influenced the output?
 - SHAP/LIME Analysis — perturbation-based feature importance scoring
@@ -360,6 +432,10 @@ User Query
     │         │
     │         PASS
     │         │
+    ├──► [Cache: Lookup]  ──── HIT ──► Return Cached Response ──► User
+    │         │
+    │         MISS
+    │         │
     ├──► [Router: Analyze Complexity] ──► Model Tier Decision
     │         │
     │    ┌────┴────────────────────────────────┐
@@ -377,6 +453,8 @@ User Query
     │         ▼
     │    [LLM Call: Selected Model + Assembled Context]
     │         │
+    │         ├──► [Cache: Write response + metadata + TTL]
+    │         │
     │         ▼
     │    [Guardrails: Output]  ──── BLOCK ──► Regenerate / Error
     │         │
@@ -391,6 +469,7 @@ User Query
     │
     └──► [Observability: Metrics + Traces across all steps]
     └──► [Evaluations: Quality scoring on response]
+    │         └──► [Batching: Submit bulk eval queries as batch job]
     └──► [Explainability: Attribution analysis on response]
 ```
 
@@ -427,6 +506,16 @@ User Query
     │ Context      │ ───────────────────────────► │  Memory Graph        │
     │ Memory       │  (async extraction)          │  (grows over time)   │
     └──────────────┘                              └──────────────────────┘
+
+    ┌──────────────┐      repeated queries        ┌──────────────────────┐
+    │ LLM Cache    │ ───────────────────────────► │  Latency & Cost      │
+    │              │  (hit rate metrics)           │  Reduction           │
+    └──────────────┘                              └──────────────────────┘
+
+    ┌──────────────┐      bulk eval results       ┌──────────────────────┐
+    │ LLM Batching │ ───────────────────────────► │  Evaluation at Scale │
+    │              │  (async batch jobs)           │  (nightly runs, A/B) │
+    └──────────────┘                              └──────────────────────┘
 ```
 
 ---
@@ -439,6 +528,8 @@ User Query
 | APIs | FastAPI, Uvicorn |
 | Vector Storage | ChromaDB, In-memory cosine similarity |
 | Graph Storage | NetworkX, SQLite |
+| Caching | Redis, In-memory LRU, Semantic similarity cache |
+| Batch Processing | Anthropic Message Batches API, OpenAI Batch API, asyncio |
 | Embeddings | sentence-transformers, OpenAI embeddings |
 | Token Counting | tiktoken, Anthropic token API |
 | Observability | OpenTelemetry, Prometheus, structlog |
@@ -464,6 +555,8 @@ User Query
 | [ai-genai-llm-observability](../ai-genai-llm-observability) | Performance monitoring | TTFT, latency, cost, OTLP traces, Prometheus metrics |
 | [ai-genai-llm-evaluations](../ai-genai-llm-evaluations) | Response quality scoring | 6 metrics via DeepEval, LLM-as-judge, batch evaluation |
 | [ai-genai-llm-explainability](../ai-genai-llm-explainability) | Model interpretability | Token attribution, SHAP/LIME, CoT analysis, Streamlit dashboard |
+| [ai-genai-llm-caching](../ai-genai-llm-caching) | LLM response caching | Exact match, semantic similarity cache, TTL management, cost savings |
+| [ai-genai-llm-batching](../ai-genai-llm-batching) | Batch query processing | Bulk eval submission, async job management, batch API pricing, result aggregation |
 
 ---
 

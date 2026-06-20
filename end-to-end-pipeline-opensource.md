@@ -18,9 +18,11 @@ A production-grade implementation of the GenAI LLM application pipeline using op
 | 8 | Observability | Langfuse + OpenTelemetry + Prometheus + Grafana |
 | 9 | Evaluations | DeepEval + RAGAS + Promptfoo (red teaming) |
 | 10 | Explainability | SHAP + Inseq + Captum |
-| 11 | Orchestration | LangGraph / CrewAI + OpenAI Agents SDK |
-| 12 | Model Serving | vLLM / SGLang (production) + Ollama (development) |
-| 13 | Infrastructure | FastAPI + PostgreSQL + Redis + Docker + Kubernetes |
+| 11 | LLM Caching | Redis (semantic cache) + GPTCache |
+| 12 | LLM Batching | Celery + LiteLLM Batch API + Custom Job Queue |
+| 13 | Orchestration | LangGraph / CrewAI + OpenAI Agents SDK |
+| 14 | Model Serving | vLLM / SGLang (production) + Ollama (development) |
+| 15 | Infrastructure | FastAPI + PostgreSQL + Redis + Docker + Kubernetes |
 
 ---
 
@@ -65,6 +67,31 @@ A production-grade implementation of the GenAI LLM application pipeline using op
 │   └────────────────────────────────────┼──────────────────────────────────────────┘     │
 │                                        │                                                 │
 │                                        ▼                                                 │
+│   ┌───────────────────────────────────────────────────────────────────────────────┐     │
+│   │              LLM CACHE (Redis + GPTCache)                                      │     │
+│   │                                                                               │     │
+│   │   ┌──────────────────┐       ┌──────────────────────────────────────────┐    │     │
+│   │   │  Incoming Query  │──────▶│           CACHE LOOKUP                   │    │     │
+│   │   └──────────────────┘       │                                          │    │     │
+│   │                              │  Strategy A: Exact Match (Redis hash)     │    │     │
+│   │                              │  Strategy B: Semantic Similarity          │    │     │
+│   │                              │    (sentence-transformers cosine ≥ 0.95)  │    │     │
+│   │                              │  Strategy C: GPTCache (LLM-aware cache   │    │     │
+│   │                              │    with adapter support)                  │    │     │
+│   │                              └──────────────────┬───────────────────────┘    │     │
+│   │                                                  │                            │     │
+│   │                               ┌─────────────────┴─────────────────┐          │     │
+│   │                               │                                   │          │     │
+│   │                          CACHE HIT                           CACHE MISS      │     │
+│   │                               │                                   │          │     │
+│   │                               ▼                                   ▼          │     │
+│   │                      ┌──────────────────┐              Continue Pipeline     │     │
+│   │                      │  Return Cached   │              (Router → LLM Call)   │     │
+│   │                      │  Response + TTL  │                                    │     │
+│   │                      │  Validation      │                                    │     │
+│   │                      └──────────────────┘                                    │     │
+│   └───────────────────────────────────────────────────────────────────────────────┘     │
+│                                                                                         │
 │   ┌───────────────────────────────────────────────────────────────────────────────┐     │
 │   │              LLM ROUTER (LiteLLM + RouteLLM)                                   │     │
 │   │              [Up to 85% cost reduction while maintaining 95% quality]          │     │
@@ -272,7 +299,32 @@ A production-grade implementation of the GenAI LLM application pipeline using op
 │   │  • Custom LLM metrics  │ │  • Red teaming         │ │  • TCAV                    │  │
 │   │  • Alerting            │ │  • Security scans      │ │                            │  │
 │   │                        │ │  • CI/CD integration   │ │                            │  │
-│   └────────────────────────┘ └────────────────────────┘ └────────────────────────────┘  │
+│   └────────────────────────┘ └────────────┬───────────┘ └────────────────────────────┘  │
+│                                           │                                              │
+│                                           ▼                                              │
+│   ┌─────────────────────────────────────────────────────────────────────────────────┐   │
+│   │                  LLM BATCHING (Celery + LiteLLM Batch)                            │   │
+│   │                                                                                  │   │
+│   │   ┌────────────────────────────────────────────────────────────────────────┐    │   │
+│   │   │                      BATCH JOB MANAGER                                 │    │   │
+│   │   │                                                                        │    │   │
+│   │   │  ┌──────────────────┐  ┌──────────────────┐  ┌─────────────────────┐  │    │   │
+│   │   │  │  Redis Queue     │  │  Celery Workers  │  │  PostgreSQL Results │  │    │   │
+│   │   │  │  (collect eval   │  │  (parallel LLM   │  │  (aggregate results │  │    │   │
+│   │   │  │   queries)       │  │   calls via      │  │   map to queries)   │  │    │   │
+│   │   │  │                  │  │   LiteLLM)       │  │                     │  │    │   │
+│   │   │  └────────┬─────────┘  └────────┬─────────┘  └──────────┬──────────┘  │    │   │
+│   │   │           └─────────────────────┼────────────────────────┘             │    │   │
+│   │   │                                 │                                      │    │   │
+│   │   │          Parallel async LLM calls (configurable concurrency)           │    │   │
+│   │   └────────────────────────────────────────────────────────────────────────┘    │   │
+│   │                                                                                  │   │
+│   │   Use Cases:                                                                     │   │
+│   │   • Batch evaluation scoring (submit 100s of eval queries concurrently)         │   │
+│   │   • Offline quality assessments (nightly eval runs via cron/scheduler)           │   │
+│   │   • Fine-tuning data validation (bulk comparison against ground truth)          │   │
+│   │   • A/B test evaluation (compare model versions across test suites)             │   │
+│   └─────────────────────────────────────────────────────────────────────────────────┘   │
 │                                                                                         │
 └─────────────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -356,6 +408,58 @@ output_scanners = [Relevance(), Sensitive()]
 sanitized_prompt, results, is_valid = scan_prompt(input_scanners, user_input)
 if not is_valid:
     return {"blocked": True, "scanners": [r for r in results if not r.is_valid]}
+```
+
+#### LLM Cache (Redis + GPTCache)
+
+Two caching layers reduce cost and latency:
+
+**Layer 1: Redis Semantic Cache**
+- Exact match: Hash-based key lookup for identical queries (sub-millisecond)
+- Semantic match: Embedding similarity via sentence-transformers (cosine threshold ≥ 0.95)
+- TTL management: Configurable expiry per query type
+- On **CACHE HIT**: returns cached response immediately, bypassing the full pipeline
+- On **CACHE MISS**: continues to Router; after LLM response, writes to cache
+
+**Layer 2: [GPTCache](https://github.com/zilliztech/GPTCache) (7.2k stars)** — LLM-aware caching:
+- Adapters for OpenAI, LangChain, LlamaIndex
+- Pluggable eviction policies (LRU, FIFO, time-based)
+- Embedding-based similarity with configurable threshold
+- Multi-backend support (Redis, SQLite, Milvus)
+
+```python
+import redis
+import hashlib
+import json
+from sentence_transformers import SentenceTransformer
+import numpy as np
+
+cache = redis.Redis(host="redis", port=6379)
+embed_model = SentenceTransformer("BAAI/bge-small-en-v1.5")
+
+def check_cache(query: str) -> dict | None:
+    # Exact match
+    cache_key = hashlib.sha256(query.encode()).hexdigest()
+    cached = cache.get(f"llm:exact:{cache_key}")
+    if cached:
+        return json.loads(cached)
+
+    # Semantic match (check top candidates)
+    query_emb = embed_model.encode(query)
+    candidates = cache.smembers("llm:semantic:keys")
+    for candidate_key in candidates:
+        stored = json.loads(cache.get(f"llm:semantic:{candidate_key.decode()}") or "{}")
+        if stored:
+            similarity = np.dot(query_emb, stored["embedding"]) / (
+                np.linalg.norm(query_emb) * np.linalg.norm(stored["embedding"])
+            )
+            if similarity >= 0.95:
+                return stored["response"]
+    return None
+
+def write_cache(query: str, response: dict, ttl: int = 3600):
+    cache_key = hashlib.sha256(query.encode()).hexdigest()
+    cache.setex(f"llm:exact:{cache_key}", ttl, json.dumps(response))
 ```
 
 #### LLM Router (LiteLLM + RouteLLM)
@@ -894,6 +998,52 @@ promptfoo eval --config promptfoo.yaml
 promptfoo redteam run --target http://localhost:8080/api/chat
 ```
 
+#### LLM Batching (Celery + LiteLLM)
+
+Custom batch processing for submitting large volumes of evaluation queries concurrently:
+
+- Collects evaluation queries into a Redis queue
+- Celery workers process queries in parallel via LiteLLM (configurable concurrency)
+- Results aggregated in PostgreSQL, mapped back to original queries
+- Supports both self-hosted models (vLLM) and cloud APIs (via LiteLLM fallback)
+
+```python
+from celery import Celery, group
+import litellm
+
+app = Celery("batching", broker="redis://redis:6379")
+
+@app.task
+def eval_single_query(query: str, model: str, eval_id: str) -> dict:
+    """Evaluate a single query as part of a batch."""
+    response = litellm.completion(
+        model=model,
+        messages=[{"role": "user", "content": query}]
+    )
+    return {
+        "eval_id": eval_id,
+        "query": query,
+        "response": response.choices[0].message.content,
+        "tokens": response.usage.total_tokens
+    }
+
+def submit_batch(queries: list[dict], model: str = "ollama/qwen3-32b") -> str:
+    """Submit a batch of evaluation queries for async processing."""
+    job = group(
+        eval_single_query.s(q["query"], model, q["id"])
+        for q in queries
+    )
+    result = job.apply_async()
+    return result.id
+
+# Submit 500 eval queries at once
+batch_id = submit_batch(eval_dataset, model="ollama/qwen3-32b")
+```
+
+**Scheduling:** Use cron jobs or Celery Beat for nightly/weekly batch evaluation runs.
+
+**Cloud batch fallback:** When using cloud providers via LiteLLM, leverage their native batch APIs (Anthropic Message Batches, OpenAI Batch API) for 50% cost savings on non-real-time workloads.
+
 #### Explainability (SHAP + Inseq)
 
 **[SHAP](https://github.com/slundberg/shap) (25.5k stars)** — Feature importance:
@@ -1151,6 +1301,10 @@ User Query
     │         │
     │         PASS
     │         │
+    ├──► [Redis + GPTCache: Cache Lookup]  ──── HIT ──► Return Cached Response ──► User
+    │         │
+    │         MISS
+    │         │
     ├──► [LiteLLM + RouteLLM: Complexity Routing] ──► Model Tier Decision
     │         │
     │    ┌────┴────────────────────────────────────┐
@@ -1168,6 +1322,8 @@ User Query
     │         ▼
     │    [LiteLLM → vLLM/SGLang: Selected Model + Context]
     │         │
+    │         ├──► [Redis: Write response + metadata + TTL]
+    │         │
     │         ▼
     │    [NeMo + LLM Guard + Instructor: Output Validation]  ──── BLOCK ──► Retry
     │         │
@@ -1183,6 +1339,7 @@ User Query
     └──► [Langfuse: Traces + Cost + Prompt Versions]
     └──► [Prometheus + Grafana: Infrastructure + LLM Metrics]
     └──► [DeepEval + RAGAS: Quality Scoring (batch + scheduled)]
+    │         └──► [Celery Batch: Submit bulk eval queries concurrently]
 ```
 
 ---
@@ -1227,6 +1384,8 @@ User Query
 | Graph Database | Neo4j Community | — |
 | Memory | Mem0 | 58.8k |
 | Temporal Memory | Graphiti | 27.6k |
+| Caching | Redis + GPTCache | — / 7.2k |
+| Batch Processing | Celery + LiteLLM Batch | — |
 | Structured Output | Instructor | High |
 | Observability | Langfuse | 29.3k |
 | Tracing Standard | OpenTelemetry | — |
